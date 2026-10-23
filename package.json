@@ -1,0 +1,16 @@
+{
+  "name": "cgn-card-generator",
+  "version": "1.0.0",
+  "description": "Gerador de cards para o Central Goiano via Puppeteer",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^121.0.0",
+    "express": "^4.19.2",
+    "form-data": "^4.0.0",
+    "node-fetch": "^2.6.7",
+    "puppeteer-core": "^22.0.0"
+  }
+}
