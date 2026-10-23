@@ -79,6 +79,8 @@ async function gerarLegendaGeminiOficial(tituloLimpo, textoCompletoMateria, apiK
         let disponiveis = dataModels.models
           .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'))
           .map(m => m.name.replace('models/', ''))
+          // Alteração pontual: impede usar Nano Banana para gerar legendas.
+          .filter(name => !/nano-banana/i.test(name))
           .sort((a, b) => b.localeCompare(a));
         if (disponiveis.length > 0) modelos = disponiveis;
       }
@@ -109,14 +111,14 @@ Conteúdo da Matéria: ${textoCompletoMateria.substring(0, 4000)}`;
   for (const modelo of modelos) {
     try {
       const URL_API = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${apiKeyGemini}`;
-      
+
       const response = await fetch(URL_API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           system_instruction: {
-            parts: [{ 
-              text: "Você é um jornalista e editor do portal Central Goiano. Sua escrita é jornalística, dividida em parágrafos menores, sem emojis. Sua única saída deve ser a legenda contida estritamente entre <legenda> e </legenda>." 
+            parts: [{
+              text: "Você é um jornalista e editor do portal Central Goiano. Sua escrita é jornalística, dividida em parágrafos menores, sem emojis. Sua única saída deve ser a legenda contida estritamente entre <legenda> e </legenda>."
             }]
           },
           contents: [{
@@ -154,9 +156,9 @@ async function processarCardEInstagramEmSegundoPlano(reqBody, protocol, host) {
   let subtituloLimpo = formatarSubtituloInteligente(subtituloBruto, 130);
   let textoBaseMateria = limparTextoLixo(textoMateria || subtitulo || tituloLimpo);
 
-  const API_KEY_GEMINI = process.env.GEMINI_API_KEY; 
-  const IG_ACCESS_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN; 
-  const IG_USER_ID = process.env.INSTAGRAM_ACCOUNT_ID;            
+  const API_KEY_GEMINI = process.env.GEMINI_API_KEY;
+  const IG_ACCESS_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN;
+  const IG_USER_ID = process.env.INSTAGRAM_ACCOUNT_ID;
 
   let browser = null;
   try {
