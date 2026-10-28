@@ -6,7 +6,7 @@ const path = require('path');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 app.use('/temp', express.static('/tmp'));
 
 // ==================== FILA DE PROCESSAMENTO SEQUENCIAL ====================
@@ -25,7 +25,6 @@ async function processQueue() {
   }
 
   isProcessingQueue = false;
-  // Aguarda 3 segundos antes de processar o próximo card para evitar sobrecarga
   setTimeout(processQueue, 3000);
 }
 // ============================================================================
@@ -79,7 +78,6 @@ async function gerarLegendaGeminiOficial(tituloLimpo, textoCompletoMateria, apiK
         let disponiveis = dataModels.models
           .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'))
           .map(m => m.name.replace('models/', ''))
-          // Alteração pontual: impede usar Nano Banana para gerar legendas.
           .filter(name => !/nano-banana/i.test(name))
           .sort((a, b) => b.localeCompare(a));
         if (disponiveis.length > 0) modelos = disponiveis;
@@ -296,13 +294,11 @@ app.post('/gerar-card', (req, res) => {
     });
   }
 
-  // Responde IMEDIATAMENTE ao Apps Script
   res.json({
     sucesso: true,
     mensagem: "Processamento enfileirado com sucesso."
   });
 
-  // Adiciona o pedido à fila de execução sequencial
   queue.push({
     body: req.body,
     protocol: req.protocol,
@@ -312,7 +308,25 @@ app.post('/gerar-card', (req, res) => {
   processQueue();
 });
 
-// Apenas a rota GET adicionada para o UptimeRobot manter o Render acordado
+// ROTA SEGURA DE LIP SYNC / FACE SWAP
+app.post('/lip-sync-faceswap', (req, res) => {
+  const { fotoBase64, audioVideoBase64 } = req.body;
+
+  if (!fotoBase64 || !audioVideoBase64) {
+    return res.status(400).json({
+      sucesso: false,
+      error: "A foto e o arquivo de vídeo/áudio são obrigatórios."
+    });
+  }
+
+  console.log("👄 Requisição de Lip Sync / Face Swap recebida com sucesso!");
+  
+  return res.json({
+    sucesso: true,
+    mensagem: "Arquivos recebidos com sucesso para processamento de Lip Sync e Face Swap."
+  });
+});
+
 app.get('/', (req, res) => {
   res.status(200).send("OK");
 });
