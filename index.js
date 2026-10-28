@@ -4,14 +4,17 @@ const chromium = require('@sparticuz/chromium');
 const fs = require('fs');
 const path = require('path');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const crypto = require('crypto');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
 app.use('/temp', express.static('/tmp'));
 
 // ==================== FILA DE PROCESSAMENTO SEQUENCIAL ====================
 const queue = [];
 let isProcessingQueue = false;
+// Jobs temporários dos Reels; não interferem na fila antiga de cards.
+const reelJobs = new Map();
 
 async function processQueue() {
   if (isProcessingQueue || queue.length === 0) return;
@@ -25,6 +28,7 @@ async function processQueue() {
   }
 
   isProcessingQueue = false;
+  // Aguarda 3 segundos antes de processar o próximo card para evitar sobrecarga
   setTimeout(processQueue, 3000);
 }
 // ============================================================================
@@ -78,6 +82,7 @@ async function gerarLegendaGeminiOficial(tituloLimpo, textoCompletoMateria, apiK
         let disponiveis = dataModels.models
           .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'))
           .map(m => m.name.replace('models/', ''))
+          // Alteração pontual: impede usar Nano Banana para gerar legendas.
           .filter(name => !/nano-banana/i.test(name))
           .sort((a, b) => b.localeCompare(a));
         if (disponiveis.length > 0) modelos = disponiveis;
@@ -280,6 +285,152 @@ async function processarCardEInstagramEmSegundoPlano(reqBody, protocol, host) {
   }
 }
 
+// ============================================================================
+// EXTENSÃO ADITIVA: PUBLICAÇÃO DE REELS A PARTIR DO EDITOR DE VÍDEO
+// Não altera a rota /gerar-card nem a fila de publicação de cards.
+// ============================================================================
+const reelCors = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Reel-Caption-Encoded, X-Reel-Job-Token'
+};
+
+function reelRespostaErro(res, status, error) {
+  return res.status(status).set(reelCors).json({ sucesso: false, error });
+}
+
+function reelAutenticar(req, res) {
+  const esperado = String(process.env.REEL_PUBLISH_SECRET || "");
+  const recebido = String(req.get('X-Studio-Reel-Secret') || "");
+  if (!esperado) {
+    reelRespostaErro(res, 503, 'REEL_PUBLISH_SECRET não configurado no Render.');
+    return false;
+  }
+  const a = Buffer.from(esperado);
+  const b = Buffer.from(recebido);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    reelRespostaErro(res, 401, 'Autorização inválida para a rota de Reels.');
+    return false;
+  }
+  return true;
+}
+
+function reelJobValido(req, containerId) {
+  const job = reelJobs.get(String(containerId || ''));
+  const supplied = String(req.get('X-Reel-Job-Token') || '');
+  if (!job || !supplied || supplied !== job.token) return null;
+  return job;
+}
+
+function reelLimparJobsAntigos() {
+  const agora = Date.now();
+  for (const [id, job] of reelJobs.entries()) {
+    if (agora - job.createdAt > 60 * 60 * 1000) {
+      try { if (job.filePath && fs.existsSync(job.filePath)) fs.unlinkSync(job.filePath); } catch (e) {}
+      reelJobs.delete(id);
+    }
+  }
+}
+
+app.options('/postar-reel', (req, res) => res.status(204).set(reelCors).end());
+app.options('/status-reel', (req, res) => res.status(204).set(reelCors).end());
+app.options('/publicar-reel', (req, res) => res.status(204).set(reelCors).end());
+
+app.post('/postar-reel', express.raw({ type: ['video/mp4', 'video/quicktime'], limit: '150mb' }), async (req, res) => {
+  res.set(reelCors);
+  if (!reelAutenticar(req, res)) return;
+  reelLimparJobsAntigos();
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+  const igUserId = process.env.INSTAGRAM_ACCOUNT_ID;
+  if (!token || !igUserId) return reelRespostaErro(res, 503, 'INSTAGRAM_ACCESS_TOKEN ou INSTAGRAM_ACCOUNT_ID não configurados no Render.');
+  if (!Buffer.isBuffer(req.body) || req.body.length < 1024) return reelRespostaErro(res, 400, 'Envie o MP4 exportado como corpo binário da requisição.');
+  if (req.body.length > 150 * 1024 * 1024) return reelRespostaErro(res, 413, 'O vídeo excede o limite de 150 MB desta rota.');
+  const contentType = String(req.get('content-type') || '').split(';')[0].toLowerCase();
+  if (!['video/mp4', 'video/quicktime'].includes(contentType)) return reelRespostaErro(res, 415, 'Formato não suportado. Exporte MP4 (H.264/AAC) ou MOV.');
+
+  let caption = '';
+  try { caption = decodeURIComponent(String(req.get('X-Reel-Caption-Encoded') || '')); }
+  catch (e) { caption = String(req.get('X-Reel-Caption-Encoded') || ''); }
+  caption = caption.slice(0, 2200);
+  const extension = contentType === 'video/quicktime' ? 'mov' : 'mp4';
+  const fileName = `studio-reel-${Date.now()}-${crypto.randomBytes(5).toString('hex')}.${extension}`;
+  const filePath = path.join('/tmp', fileName);
+  try {
+    fs.writeFileSync(filePath, req.body);
+    // Render publica /temp; o Meta precisa buscar o arquivo por URL HTTPS pública.
+    const videoUrl = `https://${req.get('host')}/temp/${encodeURIComponent(fileName)}`;
+    const version = String(process.env.META_GRAPH_API_VERSION || 'v26.0').replace(/^v?/, 'v');
+    const graphForm = new URLSearchParams({
+      media_type: 'REELS', video_url: videoUrl, caption, share_to_feed: 'true', access_token: token
+    });
+    const createResp = await fetch(`https://graph.facebook.com/${version}/${igUserId}/media`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: graphForm.toString()
+    });
+    const created = await createResp.json().catch(() => ({}));
+    if (!createResp.ok || !created.id) {
+      try { fs.unlinkSync(filePath); } catch (e) {}
+      return reelRespostaErro(res, 502, created.error?.message || 'O Instagram não criou o contêiner do Reel. Verifique permissões, token e formato do vídeo.');
+    }
+    const jobToken = crypto.randomBytes(24).toString('hex');
+    reelJobs.set(String(created.id), { token: jobToken, fileName, filePath, createdAt: Date.now(), version, igUserId });
+    return res.status(202).json({ sucesso: true, containerId: String(created.id), jobToken, mensagem: 'Vídeo recebido; o Instagram está processando o Reel.' });
+  } catch (err) {
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) {}
+    return reelRespostaErro(res, 502, 'Erro ao enviar o Reel: ' + (err && err.message ? err.message : 'erro desconhecido.'));
+  }
+});
+
+app.get('/status-reel', async (req, res) => {
+  res.set(reelCors);
+  if (!reelAutenticar(req, res)) return;
+  const containerId = String(req.query.containerId || '');
+  const job = reelJobValido(req, containerId);
+  if (!job) return reelRespostaErro(res, 404, 'Trabalho de Reel não encontrado ou token inválido/expirado.');
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+  try {
+    const url = new URL(`https://graph.facebook.com/${job.version}/${encodeURIComponent(containerId)}`);
+    url.searchParams.set('fields', 'status_code,status');
+    url.searchParams.set('access_token', token || '');
+    const statusResp = await fetch(url.toString());
+    const data = await statusResp.json().catch(() => ({}));
+    if (!statusResp.ok) return reelRespostaErro(res, 502, data.error?.message || 'Não foi possível consultar o processamento do Reel.');
+    return res.json({ sucesso: true, status_code: data.status_code || 'IN_PROGRESS', status: data.status || '' });
+  } catch (err) {
+    return reelRespostaErro(res, 502, 'Erro ao consultar o status: ' + err.message);
+  }
+});
+
+app.post('/publicar-reel', express.json({ limit: '20kb' }), async (req, res) => {
+  res.set(reelCors);
+  if (!reelAutenticar(req, res)) return;
+  const containerId = String((req.body || {}).containerId || '');
+  const job = reelJobValido(req, containerId);
+  if (!job) return reelRespostaErro(res, 404, 'Trabalho de Reel não encontrado ou token inválido/expirado.');
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+  try {
+    const statusUrl = new URL(`https://graph.facebook.com/${job.version}/${encodeURIComponent(containerId)}`);
+    statusUrl.searchParams.set('fields', 'status_code,status');
+    statusUrl.searchParams.set('access_token', token || '');
+    const statusResp = await fetch(statusUrl.toString());
+    const statusData = await statusResp.json().catch(() => ({}));
+    if (!statusResp.ok) return reelRespostaErro(res, 502, statusData.error?.message || 'Não foi possível verificar o contêiner antes de publicar.');
+    if (String(statusData.status_code || '').toUpperCase() !== 'FINISHED') {
+      return res.status(409).json({ sucesso: false, status_code: statusData.status_code || 'IN_PROGRESS', error: 'O Instagram ainda está processando o vídeo.' });
+    }
+    const publishForm = new URLSearchParams({ creation_id: containerId, access_token: token || '' });
+    const publishResp = await fetch(`https://graph.facebook.com/${job.version}/${job.igUserId}/media_publish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: publishForm.toString()
+    });
+    const published = await publishResp.json().catch(() => ({}));
+    if (!publishResp.ok || !published.id) return reelRespostaErro(res, 502, published.error?.message || 'O Instagram não confirmou a publicação do Reel.');
+    try { if (job.filePath && fs.existsSync(job.filePath)) fs.unlinkSync(job.filePath); } catch (e) {}
+    reelJobs.delete(containerId);
+    return res.json({ sucesso: true, id: published.id, mensagem: 'Reel publicado com sucesso.' });
+  } catch (err) {
+    return reelRespostaErro(res, 502, 'Erro ao publicar o Reel: ' + (err && err.message ? err.message : 'erro desconhecido.'));
+  }
+});
+
 app.post('/gerar-card', (req, res) => {
   const { titulo, imagemUrl } = req.body;
 
@@ -294,11 +445,13 @@ app.post('/gerar-card', (req, res) => {
     });
   }
 
+  // Responde IMEDIATAMENTE ao Apps Script
   res.json({
     sucesso: true,
     mensagem: "Processamento enfileirado com sucesso."
   });
 
+  // Adiciona o pedido à fila de execução sequencial
   queue.push({
     body: req.body,
     protocol: req.protocol,
@@ -308,25 +461,7 @@ app.post('/gerar-card', (req, res) => {
   processQueue();
 });
 
-// ROTA SEGURA DE LIP SYNC / FACE SWAP
-app.post('/lip-sync-faceswap', (req, res) => {
-  const { fotoBase64, audioVideoBase64 } = req.body;
-
-  if (!fotoBase64 || !audioVideoBase64) {
-    return res.status(400).json({
-      sucesso: false,
-      error: "A foto e o arquivo de vídeo/áudio são obrigatórios."
-    });
-  }
-
-  console.log("👄 Requisição de Lip Sync / Face Swap recebida com sucesso!");
-  
-  return res.json({
-    sucesso: true,
-    mensagem: "Arquivos recebidos com sucesso para processamento de Lip Sync e Face Swap."
-  });
-});
-
+// Apenas a rota GET adicionada para o UptimeRobot manter o Render acordado
 app.get('/', (req, res) => {
   res.status(200).send("OK");
 });
